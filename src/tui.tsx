@@ -1,4 +1,6 @@
+/** @jsxImportSource @opentui/solid */
 import { Plugin, usePlugin } from "@opencode/plugin/tui"
+import { createEffect, createSignal, untrack } from "solid-js"
 import { ContextView } from "./rpc"
 
 const syntax = "Usage: /context [usage|injections|config]"
@@ -8,6 +10,7 @@ type View = keyof typeof titles
 function Placeholder(props: { title: string; message: string }) {
   const context = usePlugin()
   context.keymap.layer(() => ({
+    mode: "global",
     commands: [{ bind: "q", run: () => context.ui.dialog.clear() }],
   }))
   return <box flexDirection="column" padding={1} gap={1}>
@@ -53,7 +56,7 @@ export default Plugin.define({
         }
       }
       if (!alive || current !== generation) return
-      // V2.2.5 offers xlarge, not a fullscreen custom-dialog API.
+      // The public API offers xlarge, not a fullscreen custom-dialog size.
       context.ui.dialog.set({ size: "xlarge" })
       context.ui.dialog.show(() => <Placeholder title={titles[view]} message={message} />, () => { generation++ })
     }
@@ -62,8 +65,15 @@ export default Plugin.define({
       warnCollision()
       return
     }
+    const [blocked, setBlocked] = createSignal(false)
+    createEffect(() => {
+      const next = collision()
+      if (next && !untrack(blocked)) warnCollision()
+      setBlocked(next)
+    })
     context.keymap.layer(() => ({
       mode: "global",
+      enabled: !blocked(),
       commands: [
         {
           id: "context-view.usage", title: "Context Usage", group: "Context View", palette: true,

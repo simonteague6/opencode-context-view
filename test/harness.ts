@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm } from "node:fs/promises"
+import { cp, mkdtemp, mkdir, readFile, readdir, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, isAbsolute } from "node:path"
 import { OpenCode } from "@opencode/client"
@@ -6,6 +6,7 @@ import xterm from "@xterm/headless"
 import { scriptedProvider } from "./provider"
 
 const { Terminal } = xterm
+type HostOptions = { collision?: "before" | "after"; plugin?: boolean; transport?: "http" | "websocket" }
 
 async function run(argv: string[], cwd: string, env?: Record<string, string>) {
   const process = Bun.spawn(argv, { cwd, env, stdout: "pipe", stderr: "pipe", timeout: 60_000 })
@@ -26,17 +27,15 @@ export class InstalledHost {
   tui?: ReturnType<typeof Bun.spawn>
   private changed = new Set<() => void>()
 
-  static async start() {
+  static async start(options: HostOptions = {}) {
     const host = new InstalledHost()
-    try { await host.start(); return host } catch (error) { await host.close(); throw error }
+    try { await host.start(options); return host } catch (error) { await host.close(); throw error }
   }
 
-  private async start() {
+  private async start(options: HostOptions) {
     const binary = Bun.env.CONTEXT_VIEW_HOST
-    if (!binary) throw new Error("Acceptance requires CONTEXT_VIEW_HOST pointing to an isolated OpenCode V2.2.5 binary; the live host is not a fallback.")
+    if (!binary) throw new Error("Acceptance requires CONTEXT_VIEW_HOST pointing to OpenCode V2.2.6; all host state is isolated by the fixture.")
     if (!isAbsolute(binary)) throw new Error("CONTEXT_VIEW_HOST must be an absolute path")
-    const version = await run([binary, "--version"], process.cwd())
-    if (version.trim() !== "opencode v2.2.5") throw new Error(`Required OpenCode V2.2.5; found ${version.trim()}`)
     this.root = await mkdtemp(join(Bun.env.CONTEXT_VIEW_TEST_TMP ?? tmpdir(), "context-view-"))
     this.directory = join(this.root, "project")
     await mkdir(this.directory)
@@ -47,20 +46,34 @@ export class InstalledHost {
       TMPDIR: this.root, TERM: "xterm-256color", COLORTERM: "truecolor",
       OPENCODE_PASSWORD: crypto.randomUUID(),
     }
+    const version = await run([binary, "--version"], this.directory, this.env)
+    if (version.trim() !== "opencode v2.2.6") throw new Error(`Required OpenCode V2.2.6; found ${version.trim()}`)
     // Archive and install, never a workspace link or source-tree plugin path.
     const archive = join(this.root, "plugin.tgz")
     await run(["bun", "pm", "pack", "--filename", archive], process.cwd())
     await Bun.write(join(this.directory, "package.json"), '{"private":true,"type":"module"}')
     await run(["bun", "add", archive], this.directory, this.env)
+    const plugins = options.plugin === false ? [] : [join(this.directory, "node_modules/opencode-context-view")]
+    if (options.collision) {
+      const fixture = join(this.directory, "node_modules/context-view-collision-fixture")
+      await cp(join(import.meta.dir, "fixtures/collision"), fixture, { recursive: true })
+      if (options.collision === "before") plugins.unshift(fixture)
+      else plugins.push(fixture)
+    }
     await mkdir(join(this.env.XDG_CONFIG_HOME, "opencode"), { recursive: true })
     await Bun.write(join(this.env.XDG_CONFIG_HOME, "opencode/opencode.json"), JSON.stringify({ update: "disable" }))
     await Bun.write(join(this.directory, "opencode.json"), JSON.stringify({
-      plugins: [join(this.directory, "node_modules/opencode-context-view")],
+      plugins,
       model: "fixture/fixture",
+      policies: [
+        { action: "provider.use", resource: "*", effect: "deny" },
+        { action: "provider.use", resource: "fixture", effect: "allow" },
+      ],
       providers: { fixture: {
-        name: "Deterministic fixture", package: "@opencode/ai/providers/openai-compatible",
-        settings: { baseURL: this.provider.url, apiKey: "fixture-only" },
-        models: { fixture: { name: "Fixture", limit: { context: 32000, output: 1024 } } },
+        name: "Deterministic fixture",
+        package: options.transport === "websocket" ? "@opencode/ai/providers/openai-compatible/responses" : "@opencode/ai/providers/openai-compatible",
+        settings: { baseURL: this.provider.url, apiKey: "fixture-only", transport: options.transport ?? "http" },
+        models: { fixture: { name: "Fixture", capabilities: { tools: true }, limit: { context: 32000, output: 1024 } } },
       } },
     }))
     for (const kind of ["home", "config", "data", "cache", "state"] as const) {
@@ -112,20 +125,46 @@ export class InstalledHost {
   }
 
   async screen(text: string, timeout = 15_000) {
-    if (this.text().includes(text)) return
+    return this.waitScreen(() => this.text().split("\n").map(line =>
+      line.replace(/^\s*[┃│]\s*/, "").replace(/\s*[┃│]\s*$/, ""),
+    ).join("").replace(/\s+/g, "").includes(text.replace(/\s+/g, "")), `show ${JSON.stringify(text)}`, timeout)
+  }
+
+  async absent(text: string) {
+    return this.waitScreen(() => !this.text().includes(text), `hide ${JSON.stringify(text)}`)
+  }
+
+  private async waitScreen(matches: () => boolean, description: string, timeout = 15_000) {
+    if (matches()) return
     await new Promise<void>((resolve, reject) => {
-      const check = () => { if (this.text().includes(text)) { cleanup(); resolve() } }
-      const timer = setTimeout(() => { cleanup(); reject(new Error(`Native TUI did not show ${JSON.stringify(text)}:\n${this.text()}`)) }, timeout)
+      const check = () => { if (matches()) { cleanup(); resolve() } }
+      const timer = setTimeout(() => { cleanup(); reject(new Error(`Native TUI did not ${description}:\n${this.text()}`)) }, timeout)
       const cleanup = () => { clearTimeout(timer); this.changed.delete(check) }
       this.changed.add(check)
       check()
     })
   }
 
+  key(value: string) { this.tui!.terminal!.write(value) }
+
+  async closeView() {
+    if (!this.text().includes("Escape or q to close")) return
+    this.key("\x1b")
+    await this.absent("Escape or q to close")
+  }
+
   async command(command: string) {
-    this.tui!.terminal!.write(command)
-    await this.screen(command)
+    // A space ends native slash completion before submitting the raw command.
+    this.tui!.terminal!.write(command + " ")
+    await this.screen(command + " ")
     this.tui!.terminal!.write("\r")
+  }
+
+  async prompt(text: string) {
+    this.key(text)
+    await this.screen(text)
+    this.key("\r")
+    await this.screen("Fixture response.")
   }
 
   async plugins() {
@@ -135,6 +174,30 @@ export class InstalledHost {
   async latest() {
     const { ContextView } = await import(Bun.resolveSync("opencode-context-view/rpc", this.directory))
     return this.client.rpc(ContextView).latest({ sessionID: this.sessionID }, { location: { directory: this.directory } })
+  }
+
+  async history() {
+    return {
+      messages: await this.client.session.context({ sessionID: this.sessionID }),
+      inbox: await this.client.session.inbox.list({ sessionID: this.sessionID }),
+    }
+  }
+
+  async configuration() {
+    const files: Record<string, { text: string; modified: string }> = {}
+    const collect = async (directory: string) => {
+      for (const item of await readdir(directory, { withFileTypes: true })) {
+        const path = join(directory, item.name)
+        if (item.isDirectory()) { if (item.name !== "node_modules") await collect(path); continue }
+        if (!item.isFile()) continue
+        const info = await stat(path, { bigint: true })
+        files[path] = { text: await readFile(path, "utf8"), modified: String(info.mtimeNs) }
+      }
+    }
+    await collect(this.env.XDG_CONFIG_HOME)
+    const path = join(this.directory, "opencode.json")
+    files[path] = { text: await readFile(path, "utf8"), modified: String((await stat(path, { bigint: true })).mtimeNs) }
+    return files
   }
 
   async close() {
